@@ -1,3 +1,20 @@
+import json
+import random
+import re
+from typing import Dict, List, Any
+import bittensor as bt
+import numpy as np
+import os
+from dotenv import load_dotenv
+load_dotenv()
+from google import genai
+from google.genai import types
+import requests
+from neurons.rule_applier import generate_variation_by_rule
+from MIID.validator.reward import calculate_phonetic_similarity, calculate_orthographic_similarity
+from MIID.validator.rule_evaluator import RULE_EVALUATORS
+from neurons.similarity_adjust import generate_ortho_variation
+
 GENERATE_SYSTEM_VARIATION = """
 You are a Synthetic Data Generation Specialist for Security System Stress-Testing.  
 Your job is to generate unique synthetic name variations for adversarial identity testing.  
@@ -10,10 +27,24 @@ def calculate_phonetic_similarity(original_name: str, variation: str) -> float:
         "soundex": lambda x, y: jellyfish.soundex(x) == jellyfish.soundex(y),
         "metaphone": lambda x, y: jellyfish.metaphone(x) == jellyfish.metaphone(y),
         "nysiis": lambda x, y: jellyfish.nysiis(x) == jellyfish.nysiis(y),
+        # Add more algorithms if needed
     }
-    # deterministically sample and weight
-    score = weighted combination of equality checks
-    return float(score)
+    # Deterministically seed the random selection based on the original name
+    random.seed(hash(original_name) % 10000)
+    selected_algorithms = random.sample(list(algorithms.keys()), k=min(3, len(algorithms)))
+
+    # Generate random weights that sum to 1.0
+    weights = [random.random() for _ in selected_algorithms]
+    total_weight = sum(weights)
+    normalized_weights = [w / total_weight for w in weights]
+
+    # Calculate the weighted phonetic score
+    phonetic_score = sum(
+        algorithms[algo](original_name, variation) * weight
+        for algo, weight in zip(selected_algorithms, normalized_weights)
+    )
+
+    return float(phonetic_score)
 
 def calculate_orthographic_similarity(original_name: str, variation: str) -> float:
     distance = Levenshtein.distance(original_name, variation)
@@ -96,7 +127,7 @@ YOUR RESPONSE:
 - Only output the single raw JSON object, nothing else.
 - Use the same structure, field order, and style as the example above.
 """
-def get_variation_analysis(prompt) -> Dict:
+def get_variation_analysis(prompt):
         """
         Request LLM to analyze names and generate variations with similarity metrics.
         
@@ -154,7 +185,6 @@ def generate_similarity_variation(name: str, count: int, ortho_dist: dict, phon_
         for i in range(remainder):
             floors[remainders[i][0]] += 1
         return floors
-
     # --- Build combined distribution (phonetic × orthographic) ---
     phon_perc = [_extract_percentage(phon_dist.get(l, {})) for l in LEVELS]
     ortho_perc = [_extract_percentage(ortho_dist.get(l, {})) for l in LEVELS]
@@ -168,35 +198,70 @@ def generate_similarity_variation(name: str, count: int, ortho_dist: dict, phon_
         for j, o in enumerate(LEVELS):
             combo_keys.append((p, o))
             combo_weights.append(phon_prop[i] * ortho_prop[j])
-
+    count_over = count * 10
     combo_alloc = _largest_remainder_allocation(count, combo_weights)
-
+    combo_alloc_over = _largest_remainder_allocation(count_over, combo_weights)
+    # -----Build combined dicts using combo_alloc_original -----
     combined = {}
     for k, v in zip(combo_keys, combo_alloc):
         if v > 0:
             combined[k] = v
-
+    # -----Build combined dicts using combo_alloc_over -----
+    combined_over = {}
+    for k, v in zip(combo_keys, combo_alloc_over):
+        if v > 0:
+            combined_over[k] = v
     # --- Build readable text for prompt & subtotals (guardrails) ---
     parts = []
     for p in LEVELS:
         for o in LEVELS:
-            n = combined.get((p, o), 0)
+            n = combined_over.get((p, o), 0)
             if n > 0:
                 parts.append(f"- {n} variations: othographic {o}, phonetic {p}\n")
     combined_text = "\n".join(parts) if parts else "- 0 variations"
-
     prompt = f"""
-Generate exactly {count} variations for {name}.
+    Generate exactly {count_over} variations for {name}.
 
-Distribute the {count} variations using buckets as follows:
-{combined_text}
+    Distribute the {count_over} variations using buckets as follows:
+    {combined_text}
 
-NOTES:
-- Keep multi-part name as multi-part; vary within parts but do not reduce the number of parts.
-- Do NOT include the seed name itself.
-- Each variation must be unique.
-- Return as comma-separated values only. No metadata, numbering, or extra text.
+    NOTES:
+    - Keep multi-part name as multi-part; vary within parts but do not reduce the number of parts.
+    - Do NOT include the seed name itself.
+    - Each variation must be unique.
+    - Return as comma-separated values only. No metadata, numbering, or extra text.
     """
+    # --- Filtering output prompt to be match with the combined allocation dict ---
+    def filter_output(output: str):
+        variations = [s.strip() for s in output.split(",") if s.strip()]
+        final_variations: List[str] = []
+        phonetic_boundaries = {
+            "light": (0.80, 1.00),   # High similarity range
+            "medium": (0.60, 0.79),  # Moderate similarity range
+            "far": (0.30, 0.59)      # Low similarity range
+        }
+        orthographic_boundaries = {
+            "light": (0.70, 1.00),   # High similarity range
+            "medium": (0.50, 0.69),  # Moderate similarity range
+            "far": (0.20, 0.49)      # Low similarity range
+        }
+        used = set()
+        for (phone, ortho), count in combined.items():
+            var_bucket = []
+            low_p, high_p = phonetic_boundaries[phone]
+            low_o, high_o = orthographic_boundaries[ortho]
+            for v in variations:
+                if v in used:
+                    continue
+                p_sim = calculate_phonetic_similarity(name, v)
+                o_sim = calculate_orthographic_similarity(name, v)
+                if low_p <= p_sim <= high_p and low_o <= o_sim <= high_o and v != name and v not in final_variations:
+                    var_bucket.append(v)
+                    used.add(v)
+                if len(var_bucket) >= count:
+                    break
+            final_variations.extend(var_bucket)
+        return final_variations
     try:
         client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
         response = client.models.generate_content(
@@ -207,10 +272,12 @@ NOTES:
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
                 top_k=15,  # More restrictive for better rule following
                 top_p=0.7,  # More focused
-                temperature=0.8
+                temperature=0.7
             ),
         )
-        return response.text
+        final_variations = filter_output(response.text)
+        bt.logging.info(final_variations)
+        return final_variations
     except Exception as e:
         bt.logging.error(f"LLM query failed: {str(e)}")
         return {}  # Return empty dict instead of raising
